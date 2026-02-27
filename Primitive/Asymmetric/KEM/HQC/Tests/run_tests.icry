@@ -1,0 +1,60 @@
+:l Primitive/Asymmetric/KEM/HQC/Tests/HQC128.cry
+:set tests=10
+
+// GF(2^8)
+:prove gf_mul_commutative
+:prove gf_alpha_primitive
+:exhaust gf_inv_correct
+:check gf_mul_associative
+:check gf_mul_distributive
+:exhaust gf_exp_matches_pow
+
+// Reed-Solomon
+:prove RS_Encode_correct
+:prove RS_Decode_correct
+:prove rs_generator_roots
+:check RS_encode_decode_roundtrip
+:check RS_Syndromes_zero_for_valid_codeword
+:check RS_Decode_1error
+:check RS_Decode_max_errors
+:check RS_Decode_beyond_capacity_fails
+
+// Reed-Muller
+:exhaust RM_encode_decode_roundtrip
+:exhaust RM_Decode_1bit_noise
+:exhaust RM_Decode_heavy_noise
+:check RM_roundtrip
+
+// Concatenated code
+:prove C_roundtrip
+:check C_encode_decode_roundtrip
+:check C_Decode_1bit_noise
+:check C_Encode_injective
+
+// Polynomial arithmetic
+:check ring_mul_commutative
+:check ring_mul_identity
+:check ring_mul_zero
+
+// Serialization
+:check serialization_roundtrip
+
+// Hash functions
+:prove hash_i_correct
+:prove seed_derivation_correct
+:prove hash_g_correct
+
+// KEM
+:check keygen_correct
+:check encaps_correct
+:check decaps_correct
+:check kem_correctness
+:check kem_implicit_rejection
+
+// Ada/SPARK cross-validation
+:l Primitive/Asymmetric/KEM/HQC/Tests/AdaCrossValidation.cry
+:prove ada_seeds_match
+ada_hashes_match
+ada_keygen_matches
+ada_encaps_matches
+ada_decaps_matches

@@ -1,0 +1,366 @@
+/**
+ * KAT tests for HQC-128, using intermediate values from the reference
+ * implementation.
+ *
+ */
+module Primitive::Asymmetric::KEM::HQC::Tests::HQC128 where
+
+import Primitive::Asymmetric::KEM::HQC::Instantiations::HQC128
+
+// -------------------- Intermediate test values --------------------
+
+test_seed_kem = split`{32} 0x9ef877fddbe8891c6e4e79eaf022e563defaca6b152161b9a423e8fe96a403e7
+test_m        = split`{16} 0x74b2d352cf74c934069c9de74757f505
+test_salt     = split`{16} 0xaaf9baf4ae72c4c9b48efd574140a7bc
+
+// Expected intermediate values
+test_seed_dk  = split`{32} 0x12daf031bdc7fc592e0003a21eefa9a1019539abccc8f67075947cbfeaac98c5
+test_seed_ek  = split`{32} 0xef2b80f46f3a6437b4d869bb38bdd6004bff72bcd0ceb139b4b8d47301f4fcb1
+test_seed_pke = split`{32} 0x81313de32ad36c4779865fe66dda28aa9228818c0f3e2fa0348ef16e377d1049
+test_sigma    = split`{16} 0xd2f55cdd7665ebf10318f96adc8dc30c
+test_hash_ek  = split`{32} 0xc31c33c3b2962576dd3b73c579c9e87eaa1aef5fb437f8c92e65d6670adbcdec
+test_theta    = split`{32} 0x9d48e9a9692a698cc29c3a97473f69ea9279c438d1fc28440305fd0d23f73c74
+test_K        = split`{32} 0x4fd2917248a82ba3a97f755d5fd823aa4a7f435413639d02ab75c06923e5b603
+
+// RS codeword for the test message
+test_rs_codeword = split`{46} 0xeda27a14973188fe613ac94fbedf1106416fb391801bbee1e2e7677430bf74b2d352cf74c934069c9de74757f505
+
+// -------------------- RS tests --------------------
+
+/**
+ * Verify RS encoding matches intermediate value.
+ * ```repl
+ * :prove RS_Encode_correct
+ * ```
+ */
+property RS_Encode_correct =
+    RS_Encode test_m == test_rs_codeword
+
+/**
+ * Verify RS decode recovers message from codeword.
+ * ```repl
+ * :prove RS_Decode_correct
+ * ```
+ */
+property RS_Decode_correct =
+    RS_Decode test_rs_codeword == test_m
+
+// -------------------- RM tests --------------------
+
+/**
+ * Verify RM encode/decode round-trip for all byte values.
+ * ```repl
+ * :check RM_roundtrip
+ * ```
+ */
+property RM_roundtrip (m : Byte) =
+    RM_Decode_byte (RM_Encode m) == m
+
+// -------------------- Concatenated code tests --------------------
+
+/**
+ * Verify concatenated code round-trip.
+ * ```repl
+ * :prove C_roundtrip
+ * ```
+ */
+property C_roundtrip =
+    C_Decode (C_Encode test_m) == test_m
+
+// -------------------- Hash function tests --------------------
+
+/**
+ * Verify I (hash function for seed derivation).
+ * ```repl
+ * :prove hash_i_correct
+ * ```
+ */
+property hash_i_correct =
+    I test_seed_pke == (test_seed_dk # test_seed_ek)
+
+// -------------------- Seed derivation tests --------------------
+
+/**
+ * Verify seed_pke and sigma derivation from seed_kem.
+ * ```repl
+ * :prove seed_derivation_correct
+ * ```
+ */
+property seed_derivation_correct = seed_pke == test_seed_pke /\ sigma == test_sigma where
+    kem_stream = XOF test_seed_kem
+    seed_pke : [32]Byte
+    seed_pke = take`{32} kem_stream
+    sigma : [16]Byte
+    sigma = take`{16} (drop`{32} kem_stream)
+
+// -------------------- Hash and encapsulation tests --------------------
+
+/**
+ * Verify G (hash function) produces correct K and theta.
+ * ```repl
+ * :prove hash_g_correct
+ * ```
+ */
+property hash_g_correct = K_ok /\ theta_ok where
+    g_out = G test_hash_ek test_m test_salt
+    K : [32]Byte
+    K = take`{32} g_out
+    theta : [32]Byte
+    theta = drop`{32} g_out
+    K_ok = K == test_K
+    theta_ok = theta == test_theta
+
+// -------------------- Full KEM tests --------------------
+
+/** Expected s vector (first 20 bytes from intermediate values). */
+test_s_start = [0x59, 0x00, 0xb3, 0xf2, 0xea, 0x14, 0x9d, 0xaa, 0xdb, 0xe8,
+                0x9a, 0xc0, 0x93, 0x6b, 0x9d, 0x87, 0x1a, 0x5e, 0x5e, 0x5b] : [20][8]
+
+/** Expected ciphertext u start (first 20 bytes from intermediate values). */
+test_ct_start = [0x16, 0x8c, 0xd0, 0x45, 0xf5, 0xbd, 0xce, 0x40, 0x4c, 0xdf,
+                 0x16, 0xd5, 0xf9, 0x88, 0x17, 0x26, 0xa2, 0x28, 0xa9, 0xd0] : [20][8]
+
+/**
+ * Verify KeyGen produces correct public key (s vector).
+ * ```repl
+ * :check keygen_correct
+ * ```
+ */
+property keygen_correct = s_ok /\ dk_ok where
+    (ek, dk) = KeyGen test_seed_kem
+    s_bytes = drop`{32} ek
+    s_ok = take`{20} s_bytes == test_s_start
+    // dk starts with ek, then seed_dk, sigma, seed_kem
+    dk_ek = take`{2241} dk : [2241][8]
+    dk_ok = dk_ek == ek
+
+/**
+ * Verify Encaps produces correct shared secret and ciphertext.
+ * ```repl
+ * :check encaps_correct
+ * ```
+ */
+property encaps_correct = K_ok /\ ct_ok where
+    (ek, _) = KeyGen test_seed_kem
+    (K, ct) = Encaps ek test_m test_salt
+    K_ok = K == test_K
+    ct_ok = take`{20} ct == test_ct_start
+
+/**
+ * Verify Decaps produces correct shared secret (round-trip).
+ * ```repl
+ * :check decaps_correct
+ * ```
+ */
+property decaps_correct = ss == K where
+    (ek, dk) = KeyGen test_seed_kem
+    (K, ct) = Encaps ek test_m test_salt
+    ss = Decaps dk ct
+
+// -------------------- Noisy decoding tests --------------------
+
+/**
+ * Flip a single bit at position `pos` in a bitvector.
+ */
+flip_bit : {m} (fin m, m >= 1) => [m] -> [width m] -> [m]
+flip_bit v pos = v ^ (1 << pos)
+
+/**
+ * RM decoding tolerates a single bit flip per 128-bit copy.
+ * We flip bit 0 in the first copy of the encoded block.
+ * ```repl
+ * :exhaust RM_Decode_1bit_noise
+ * ```
+ */
+property RM_Decode_1bit_noise (m : Byte) =
+    RM_Decode_byte noisy == m where
+        clean = RM_Encode m
+        noisy = flip_bit clean 0
+
+/**
+ * RS decoding corrects a single symbol error.
+ * We corrupt byte 0 of the codeword by XORing with 0xFF.
+ * ```repl
+ * :check RS_Decode_1error
+ * ```
+ */
+property RS_Decode_1error (msg : [16]Byte) =
+    RS_Decode noisy == msg where
+        clean = RS_Encode msg
+        noisy = [if i == (0 : [16]) then (clean @ i) ^ 0xFF
+                 else clean @ i
+                | i <- [0..<46] : [46][16]]
+
+/**
+ * RS decoding corrects 15 symbol errors — the maximum capacity for HQC-128.
+ * We corrupt the first 15 bytes.
+ * ```repl
+ * :check RS_Decode_max_errors
+ * ```
+ */
+property RS_Decode_max_errors (msg : [16]Byte) =
+    RS_Decode noisy == msg where
+        clean = RS_Encode msg
+        noisy = [if (i : [16]) < 15 then (clean @ i) ^ 0xFF
+                 else clean @ i
+                | i <- [0..<46] : [46][16]]
+
+/**
+ * Concatenated code decoding corrects a single bit flip.
+ * We flip one bit in the encoded bitvector.
+ * ```repl
+ * :check C_Decode_1bit_noise
+ * ```
+ */
+property C_Decode_1bit_noise (msg : [16]Byte) =
+    C_Decode noisy == msg where
+        clean = C_Encode msg
+        noisy = flip_bit clean 0
+
+// -------------------- Additional assurance properties --------------------
+
+// ---- GF(2^8) ----
+
+/**
+ * GF(2^8) multiplication distributes over addition (XOR).
+ * ```repl
+ * :check gf_mul_distributive
+ * ```
+ */
+property gf_mul_distributive (a : [8]) (b : [8]) (c : [8]) =
+    gf_mul a (b ^ c) == gf_mul a b ^ gf_mul a c
+
+/**
+ * Exponentiation table matches gf_pow definition.
+ * ```repl
+ * :exhaust gf_exp_matches_pow
+ * ```
+ */
+property gf_exp_matches_pow (i : [8]) =
+    gf_exp @ i == gf_pow alpha i
+
+// ---- Reed-Solomon ----
+
+/**
+ * Each alpha^i for i=1..2*delta is a root of the generator polynomial.
+ * This is the defining property of the RS generator.
+ * ```repl
+ * :prove rs_generator_roots
+ * ```
+ */
+property rs_generator_roots =
+    and [ eval_poly i == 0x00 | i <- [1..30] : [30][16] ]
+    where
+        gen = rs_generator_poly
+        eval_poly : [16] -> [8]
+        eval_poly i = foldl (\acc j -> gf_mul acc root ^ (gen @ j))
+                            0x00
+                            ([0..30] : [_][16])
+            where root = gf_exp @ (i % 255)
+
+/**
+ * Syndromes of a valid RS codeword are all zero.
+ * ```repl
+ * :check RS_Syndromes_zero_for_valid_codeword
+ * ```
+ */
+property RS_Syndromes_zero_for_valid_codeword (msg : [16]Byte) =
+    RS_Syndromes (RS_Encode msg) == zero
+
+/**
+ * RS decode with delta+1 (16) errors: decoder is not guaranteed to
+ * recover the message. This checks that it usually fails, providing
+ * evidence the correction bound is tight.
+ * ```repl
+ * :check RS_Decode_beyond_capacity_fails
+ * ```
+ */
+property RS_Decode_beyond_capacity_fails (msg : [16]Byte) =
+    RS_Decode noisy != msg where
+        clean = RS_Encode msg
+        noisy = [if (i : [16]) < 16 then (clean @ i) ^ 0xFF
+                 else clean @ i
+                | i <- [0..<46] : [46][16]]
+
+// ---- Reed-Muller ----
+
+/**
+ * RM decoding tolerates up to 95 bit flips (just under the majority
+ * threshold of RMMF*128/2 = 192 for 3 copies of 128 bits).
+ * We flip the first 95 bits of the 384-bit block.
+ * ```repl
+ * :exhaust RM_Decode_heavy_noise
+ * ```
+ */
+property RM_Decode_heavy_noise (m : Byte) =
+    RM_Decode_byte noisy == m where
+        clean = RM_Encode m
+        // Flip bits 0..94: XOR with a mask of 95 ones at the low end
+        mask : [384]
+        mask = (zero : [289]) # (ones : [95])
+        noisy = clean ^ mask
+        ones : [95]
+        ones = ~zero
+
+// ---- Concatenated Code ----
+
+/**
+ * Encoding is injective: distinct messages produce distinct codewords.
+ * ```repl
+ * :check C_Encode_injective
+ * ```
+ */
+property C_Encode_injective (m1 : [16]Byte) (m2 : [16]Byte) =
+    m1 != m2 ==> C_Encode m1 != C_Encode m2
+
+// ---- Polynomial Arithmetic ----
+
+/**
+ * Multiplicative identity: ring_mul a 1 == a.
+ * The polynomial "1" has only the x^0 coefficient set.
+ * In Cryptol MSB-first convention, x^0 is the last bit.
+ * ```repl
+ * :check ring_mul_identity
+ * ```
+ */
+property ring_mul_identity (a : [17669]) =
+    ring_mul a (0 # (1 : [1])) == a
+
+/**
+ * Multiplicative zero: ring_mul a 0 == 0.
+ * ```repl
+ * :check ring_mul_zero
+ * ```
+ */
+property ring_mul_zero (a : [17669]) =
+    ring_mul a zero == zero
+
+// ---- Serialization ----
+
+/**
+ * bits_to_bytes / bytes_to_bits round-trip for n-bit vectors.
+ * ```repl
+ * :check serialization_roundtrip
+ * ```
+ */
+property serialization_roundtrip (v : [17669]) =
+    bytes_to_bits`{17669} (bits_to_bytes`{17669} v) == v
+
+// ---- KEM ----
+
+/**
+ * Implicit rejection: corrupting the ciphertext causes Decaps to
+ * return K_bar (the rejection key) instead of the real shared secret.
+ * ```repl
+ * :check kem_implicit_rejection
+ * ```
+ */
+property kem_implicit_rejection (seed_kem : [32]Byte) (m : [16]Byte) (salt : [16]Byte) =
+    ss != K where
+        (ek, dk) = KeyGen seed_kem
+        (K, ct) = Encaps ek m salt
+        // Flip a bit in the ciphertext
+        corrupted_ct = [if i == (0 : [width 4433]) then (ct @ i) ^ 0x80
+                        else ct @ i
+                       | i <- [0..<4433] : [4433][width 4433]]
+        ss = Decaps dk corrupted_ct

@@ -1,0 +1,12 @@
+/*
+ */
+module Primitive::Asymmetric::KEM::HQC::Instantiations::HQC256 =
+    Primitive::Asymmetric::KEM::HQC::Specification where
+
+type n = 57637
+type n2 = 640
+type k = 32
+type delta = 29
+type omega = 131
+type omega_r = 149
+type omega_e = 149
