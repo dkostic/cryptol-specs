@@ -1,0 +1,949 @@
+/**
+ * HQC (Hamming Quasi-Cyclic) key encapsulation mechanism for establishing
+ * a shared secret key between two parties.
+ *
+ * This implements the HQC specification (August 2025 version) as selected
+ * by NIST for standardization. HQC-KEM is built on HQC-PKE using the
+ * Fujisaki-Okamoto transform with implicit rejection. HQC-PKE uses
+ * Reed-Solomon + Reed-Muller concatenated codes for error correction
+ * and GF(2)[X]/(X^n - 1) polynomial arithmetic for the quasi-cyclic
+ * structure.
+ *
+ * The executable spec differs from the spec in several important ways:
+ * - In the spec, three HQC-KEM functions (`KeyGen`, `Encaps`, and
+ *   `Decaps`) require the generation of randomness. In the executable
+ *   spec, this randomness is passed as input, because Cryptol cannot
+ *   generate randomness. Implementors must manually verify that their
+ *   functions generate randomness using an approved RBG with a suitable
+ *   security strength.
+ * - The spec requires that intermediate values must be destroyed prior
+ *   to termination. Cryptol cannot express this requirement.
+ * - The spec requires constant-time implementations. Cryptol cannot
+ *   verify timing properties.
+ *
+ * The following design choices deviate from the spec but are
+ * traceably equivalent:
+ * - Root finding uses brute-force evaluation at all 256 field elements
+ *   rather than the spec's additive FFT ([HQC-SPEC] Section 3.4.2).
+ *   Both produce identical results.
+ * - GF(2^8) exponentiation, logarithm, and RS generator polynomial
+ *   are computed from the field definition rather than stored as
+ *   lookup tables.
+ *
+ * Sources:
+ * [HQC-SPEC]: Melchor, C.A., Music, L., Sendrier, N., and Vasseur, V.
+ *     HQC (Hamming Quasi-Cyclic). August 2025.
+ *     @see https://pqc-hqc.org/
+ */
+module Primitive::Asymmetric::KEM::HQC::Specification where
+
+import Common::utils (while)
+
+import Primitive::Keyless::Hash::SHA3::Instantiations::SHA3_256 as SHA3_256
+import Primitive::Keyless::Hash::SHA3::Instantiations::SHA3_512 as SHA3_512
+import Primitive::Keyless::Hash::SHA3::Instantiations::SHAKE256 as SHAKE256
+
+parameter
+    type n : #
+    type constraint (fin n, n >= (k + 2 * delta) * n2, 32 >= width n)
+
+    type n2 : #
+    type constraint (fin n2, n2 >= 128, n2 % 128 == 0)
+
+    type k : #
+    type constraint (fin k, k >= 1, 16 >= width (k + 2 * delta))
+
+    type delta : #
+    type constraint (fin delta, delta >= 2, 16 >= width (2 * delta))
+
+    type omega : #
+    type constraint (fin omega, omega >= 1)
+
+    type omega_r : #
+    type constraint (fin omega_r, omega_r >= 1, width n >= width omega_r, 32 >= width omega_r)
+
+    type omega_e : #
+    type constraint (fin omega_e, omega_e >= 1, width n >= width omega_e, 32 >= width omega_e)
+
+// -------------------- Derived Types --------------------
+
+type n1 = k + 2 * delta
+type g = 2 * delta
+type n1n2 = n1 * n2
+type RMMF = n2 / 128
+/** Number of sigma polynomial coefficients (delta + 1). */
+type DELTA1 = delta + 1
+type VEC_N_SIZE_BYTES = n /^ 8
+type VEC_N1N2_SIZE_BYTES = n1n2 /^ 8
+type CRYPTO_PUBLICKEYBYTES = VEC_N_SIZE_BYTES + 32
+type CRYPTO_SECRETKEYBYTES = CRYPTO_PUBLICKEYBYTES + 32 + k + 32
+type CRYPTO_CIPHERTEXTBYTES = VEC_N_SIZE_BYTES + VEC_N1N2_SIZE_BYTES + 16
+
+// -------------------- Basic Types --------------------
+
+type Byte = [8]
+type EncapsulationKey = [CRYPTO_PUBLICKEYBYTES]Byte
+type DecapsulationKey = [CRYPTO_SECRETKEYBYTES]Byte
+type Ciphertext = [CRYPTO_CIPHERTEXTBYTES]Byte
+type SharedSecretKey = [32]Byte
+
+// ============================================================
+// GF(2^8) Arithmetic
+// [HQC-SPEC] Section 2, Section 3.4.2
+// ============================================================
+
+/**
+ * Irreducible polynomial for HQC's GF(2^8).
+ * P(x) = x^8 + x^4 + x^3 + x^2 + 1 (0x11D).
+ * [HQC-SPEC] Section 2: "F_{2^8} = F_2[X] / (1 + X^2 + X^3 + X^4 + X^8)"
+ * NOTE: This is NOT the same polynomial as AES (0x11B).
+ */
+type GF256_MOD = 0x11D
+
+/**
+ * Multiply two elements of GF(2^8).
+ * [HQC-SPEC] Section 3.4.2.
+ */
+gf_mul : [8] -> [8] -> [8]
+gf_mul a b = pmod (pmult a b) (`GF256_MOD : [9])
+
+/**
+ * Exponentiation in GF(2^8) by repeated squaring.
+ * [HQC-SPEC] Section 3.4.2.
+ */
+gf_pow : [8] -> [8] -> [8]
+gf_pow base exp = foldl step 0x01 (exp : [8]) where
+    step acc bit = if bit then gf_mul (gf_mul acc acc) base
+                          else gf_mul acc acc
+
+/**
+ * Multiplicative inverse in GF(2^8).
+ * By Fermat's little theorem, a^(-1) = a^254 in GF(2^8).
+ * [HQC-SPEC] Section 3.4.2.
+ */
+gf_inv : [8] -> [8]
+gf_inv a = gf_pow a 254
+
+/**
+ * The generator element alpha = 2 in GF(2^8).
+ * [HQC-SPEC] Section 2: "Let alpha denote a primitive element in F_{2^m}"
+ */
+alpha : [8]
+alpha = 0x02
+
+/**
+ * Table of alpha^i for i in [0..255].
+ * [HQC-SPEC] Section 3.4.2.
+ */
+gf_exp : [256][8]
+gf_exp = pows where
+    pows = [0x01] # [gf_mul (pows @ i) alpha | i <- [0..254] : [255][8]]
+
+/**
+ * GF(2^8) multiplication is commutative.
+ * ```repl
+ * :prove gf_mul_commutative
+ * ```
+ */
+property gf_mul_commutative (a : [8]) (b : [8]) = gf_mul a b == gf_mul b a
+
+/**
+ * GF(2^8) multiplication is associative.
+ * ```repl
+ * :check gf_mul_associative
+ * ```
+ */
+property gf_mul_associative (a : [8]) (b : [8]) (c : [8]) =
+    gf_mul (gf_mul a b) c == gf_mul a (gf_mul b c)
+
+/**
+ * Every nonzero element has a multiplicative inverse.
+ * ```repl
+ * :exhaust gf_inv_correct
+ * ```
+ */
+property gf_inv_correct (a : [8]) =
+    a == 0 \/ gf_mul a (gf_inv a) == 0x01
+
+/**
+ * Alpha is a primitive element (order 255).
+ * ```repl
+ * :prove gf_alpha_primitive
+ * ```
+ */
+property gf_alpha_primitive = gf_exp @ 255 == 0x01
+
+// ============================================================
+// Reed-Solomon Code
+// [HQC-SPEC] Section 3.4.2
+// ============================================================
+
+/**
+ * RS generator polynomial g(x) = prod_{i=1}^{2*delta} (x - alpha^i).
+ * Stored as [g_0, g_1, ..., g_{g-1}, 1] (monic, degree g).
+ * [HQC-SPEC] Section 3.4.2, "Generator polynomial".
+ */
+rs_generator_poly : [g + 1][8]
+rs_generator_poly = polys ! 0 where
+    init : [g + 1][8]
+    init = [gf_exp @ 1] # [0x01] # zero
+    polys = [init] # [mul_root prev i | prev <- polys
+                                       | i <- [2..2*delta] : [_][16]]
+    mul_root : [g + 1][8] -> [16] -> [g + 1][8]
+    mul_root p ri = [ gf_mul (gf_exp @ (ri % 256)) (p @ j) ^
+                      (if j > 0 then p @ (j - 1) else 0x00)
+                    | j <- [0..g] : [_][16] ]
+
+/**
+ * RS systematic encoding.
+ * Output: [parity (g bytes) || message (k bytes)].
+ * [HQC-SPEC] Section 3.4.2, "Encoding".
+ */
+rs_encode : [k]Byte -> [n1]Byte
+rs_encode msg = codeword where
+    gen = take`{g} rs_generator_poly  // g_0 .. g_{g-1}
+    // Shift register computation
+    final_reg = foldl shift_step (zero : [g]Byte) ([0..<k] : [k][width k])
+    shift_step reg i = new_reg where
+        gate_value = (msg @ (`k - 1 - (zext i : [width n1]))) ^ (reg @ (`g - 1 : [width g]))
+        tmp = [gf_mul gate_value (gen @ j) | j <- [0..<g] : [g][width g]]
+        new_reg = [tmp @ 0] #
+                  [((reg @ (j - 1)) ^ (tmp @ j)) | j <- [1..<g] : [_][width g]]
+    codeword = final_reg # msg
+
+/**
+ * Compute syndromes S[i] = sum_j cdw[j] * alpha^((i+1)*j) for i=0..2δ-1.
+ * [HQC-SPEC] Section 3.4.2, "Decoding", Step 1.
+ */
+rs_syndromes : [n1]Byte -> [g][8]
+rs_syndromes cdw = syndromes where
+    syndromes = [ foldl (\acc j -> acc ^ gf_mul (cdw @ j) (gf_exp @ ((((i : [16]) + 1) * (j : [16])) % 255)))
+                        (0x00 : [8])
+                        ([0..<n1] : [n1][16])
+                | i <- [0..<g] : [g][16] ]
+
+/**
+ * Berlekamp-Massey algorithm for error locator polynomial.
+ * Returns (sigma, degree) where sigma has delta+1 coefficients.
+ * [HQC-SPEC] Section 3.4.2, "Decoding", Step 2.
+ */
+berlekamp_massey : [g][8] -> ([DELTA1][8], [16])
+berlekamp_massey syndromes = (sigma, deg_sigma) where
+    type SZ = DELTA1
+    // State: (sigma, X_sigma_p, deg_sigma, deg_sigma_p, pp, d_p, d)
+    type BMState = ([SZ][8], [SZ][8], [16], [16], [16], [8], [8])
+
+    init_X : [SZ][8]
+    init_X = [0x00, 0x01] # zero
+
+    init_d = syndromes @ 0
+
+    init : BMState
+    init = ([0x01] # zero, init_X, 0, 0, -1, 0x01, init_d)
+
+    final = foldl bm_step init ([0..<g] : [g][16])
+
+    bm_step : BMState -> [16] -> BMState
+    bm_step (sig, xsp, ds, dsp, pp, dp, d) mu = result where
+        sigma_copy = sig
+        deg_sigma_copy = ds
+
+        dd = gf_mul d (gf_inv dp)
+
+        // Update sigma: sigma[i] ^= dd * X_sigma_p[i]
+        new_sig : [SZ][8]
+        new_sig = [ if i >= 1 /\ i <= mu + 1 /\ i <= `delta
+                    then (sig @ i) ^ gf_mul dd (xsp @ i)
+                    else sig @ i
+                  | i <- [0..delta] : [_][16] ]
+
+        deg_X = mu - pp
+        deg_X_sigma_p = deg_X + dsp
+
+        d_nonzero = d != 0x00
+        deg_increased = deg_X_sigma_p > ds
+        do_swap = d_nonzero /\ deg_increased
+
+        new_ds = if do_swap then deg_X_sigma_p else ds
+
+        // Early exit for last iteration (mu == 2*delta - 1)
+        is_last = mu == (`g - 1 : [16])
+
+        new_pp  = if do_swap /\ ~is_last then mu  else pp
+        new_dp  = if do_swap /\ ~is_last then d   else dp
+        new_xsp : [SZ][8]
+        new_xsp = [ if is_last then xsp @ i
+                    else if i == 0 then 0x00
+                    else if do_swap then sigma_copy @ (i - 1)
+                    else xsp @ (i - 1)
+                  | i <- [0..delta] : [_][16] ]
+        new_dsp = if do_swap /\ ~is_last then deg_sigma_copy else dsp
+
+        // Compute next discrepancy
+        next_syn_idx = if mu + 1 < `g then mu + 1 else 0
+        new_d = if is_last then d
+                else foldl (\acc i ->
+                    if i >= 1 /\ i <= mu + 1 /\ i <= `delta
+                    then acc ^ gf_mul (new_sig @ i) (syndromes @ (next_syn_idx - i))
+                    else acc)
+                 (syndromes @ next_syn_idx)
+                 ([1..delta] : [_][16])
+
+        result = (new_sig, new_xsp, new_ds, new_dsp, new_pp, new_dp, new_d)
+
+    (sigma, _, deg_sigma, _, _, _, _) = final
+
+/**
+ * Find error positions by brute-force evaluation of sigma.
+ * If sigma(alpha^(-i)) == 0, position i is an error location.
+ * [HQC-SPEC] Section 3.4.2, "Decoding", Step 3.
+ * NOTE: The spec uses an additive FFT; this implementation uses brute-force
+ * evaluation which is simpler and produces identical results.
+ */
+rs_find_roots : [DELTA1][8] -> [16] -> [n1][8]
+rs_find_roots sigma degree = err_locs where
+    // err_locs[i] = 1 if sigma(alpha^(-i)) == 0 for i in 0..n1-1
+    // alpha^(-i) = alpha^(255-i) = gf_exp[(255 - i) % 255]
+    err_locs = [ if eval_sigma i == 0x00 then 0x01 else 0x00
+            | i <- [0..<n1] : [n1][16] ]
+    eval_sigma : [16] -> [8]
+    eval_sigma i = foldl eval_term (sigma @ 0) ([1..delta] : [_][16])
+        where
+            xi = gf_exp @ ((255 - i) % 255)
+            eval_term acc j =
+                if j <= degree
+                then acc ^ gf_mul (sigma @ j) (gf_pow xi (drop j : [8]))
+                else acc
+
+/**
+ * Compute the error evaluator polynomial z(x).
+ * z[0] = 1; z[i] = sigma[i] for 1 <= i <= degree;
+ * then z[1] ^= S[0]; and for i >= 2:
+ *   z[i] ^= S[i-1] + sum_{j=1}^{i-1} sigma[j]*S[i-j-1]
+ * [HQC-SPEC] Section 3.4.2, "Decoding", Step 4.
+ */
+compute_z_poly : [DELTA1][8] -> [16] -> [g][8] -> [DELTA1][8]
+compute_z_poly sigma degree syndromes = z_final where
+    // Step 1: z[0] = 1, z[i] = sigma[i] for i <= degree, else 0
+    z_init : [DELTA1][8]
+    z_init = [0x01] #
+             [if (i : [16]) <= degree then sigma @ i else 0x00
+             | i <- [1..delta] : [_][16]]
+
+    // Step 2: z[1] ^= syndromes[0]
+    z_step2 = update z_init (1 : [width DELTA1])
+                     ((z_init @ 1) ^ (syndromes @ 0))
+
+    // Step 3: for i = 2..delta: z[i] ^= syndromes[i-1] + sum sigma[j]*syndromes[i-j-1]
+    z_final = foldl z_update z_step2 ([2..delta] : [_][16])
+    z_update z i =
+        if (i : [16]) > `delta then z
+        else if i > degree then z
+        else update z i ((z @ i) ^ contrib)
+        where
+            contrib = foldl (\acc j ->
+                        if j < i
+                        then acc ^ gf_mul (sigma @ j) (syndromes @ (i - j - 1))
+                        else acc)
+                      (syndromes @ (i - 1))
+                      ([1..delta] : [_][16])
+
+/**
+ * Compute error values using Forney's formula.
+ * e_j = Z(beta_j^{-1}) / prod_{k != j} (1 + beta_k * beta_j^{-1})
+ * [HQC-SPEC] Section 3.4.2, "Decoding", Step 5.
+ */
+compute_error_values : [DELTA1][8] -> [n1][8] -> [n1][8]
+// z: error evaluator poly, err_locs: binary vector of error positions
+compute_error_values z err_locs = error_values where
+    // Collect beta_j = alpha^(position of j-th error)
+    (beta_arr, num_errors) =
+        foldl (\(betas, cnt) i ->
+            if (err_locs @ i) != 0x00
+            then (update betas cnt (gf_exp @ (i : [16])), cnt + 1)
+            else (betas, cnt))
+        (zero : [delta][8], 0 : [16])
+        ([0..<n1] : [n1][16])
+
+    // Compute e_j for each error
+    e_arr : [delta][8]
+    e_arr = [ if (i : [16]) < num_errors then compute_ej i else 0x00
+            | i <- [0..<delta] : [delta][16] ]
+
+    compute_ej : [16] -> [8]
+    compute_ej i = gf_mul tmp1 (gf_inv tmp2) where
+        inv_beta = gf_inv (beta_arr @ i)
+        // tmp1 = Z(beta_j^{-1}) = sum_j z[j] * inv_beta^j
+        tmp1_result = foldl eval_z
+                            ((0x00 : [8]), (0x01 : [8]))
+                            ([0..delta] : [_][16])
+        eval_z (acc, pw) j =
+            if j <= `delta
+            then (acc ^ gf_mul pw (z @ j), gf_mul pw inv_beta)
+            else (acc, pw)
+        tmp1 = tmp1_result.0
+        // tmp2 = prod_{k != i} (1 + beta_k * inv_beta)
+        // Iterate all offsets 1..delta-1; zero-initialized beta_arr
+        // entries for unused positions produce factor 1 (neutral).
+        tmp2 = foldl (\acc k_off ->
+                    gf_mul acc (0x01 ^ gf_mul inv_beta (beta_arr @ ((i + k_off) % `delta)))
+               )
+               (0x01 : [8])
+               ([1..<delta] : [_][16])
+
+    // Place error values at correct positions
+    error_values : [n1][8]
+    error_values = ev_result.0 where
+        ev_result =
+            foldl (\(ev, cnt) i ->
+                if (err_locs @ i) != 0x00
+                then (update ev (i : [16]) (e_arr @ cnt), cnt + 1)
+                else (ev, cnt))
+            (zero : [n1][8], 0 : [16])
+            ([0..<n1] : [n1][16])
+
+/**
+ * Full Reed-Solomon decoding.
+ * [HQC-SPEC] Section 3.4.2, "Decoding".
+ */
+rs_decode : [n1]Byte -> [k]Byte
+rs_decode received = drop`{g} corrected where
+    syns = rs_syndromes received
+    (sigma, degree) = berlekamp_massey syns
+    err_locs = rs_find_roots sigma degree
+    z = compute_z_poly sigma degree syns
+    error_vals = compute_error_values z err_locs
+    corrected = [received @ i ^ error_vals @ i | i <- [0..<n1] : [_][16]]
+
+/**
+ * RS encode/decode round-trip: decoding a clean codeword recovers the message.
+ * ```repl
+ * :check rs_encode_decode_roundtrip
+ * ```
+ */
+property rs_encode_decode_roundtrip (msg : [k]Byte) =
+    rs_decode (rs_encode msg) == msg
+
+// ============================================================
+// Reed-Muller Code
+// [HQC-SPEC] Section 3.4.3
+// ============================================================
+
+/**
+ * RM(1,7) encoding of a single byte into 128 bits.
+ * Evaluates the affine Boolean function m7 + m0*x0 + ... + m6*x6
+ * at all 128 points of GF(2)^7.
+ * [HQC-SPEC] Section 3.4.3, "Encoding".
+ */
+rm_encode_byte : Byte -> [128]
+rm_encode_byte m = reverse (join [ [c_at i] | i <- [0..127] : [128][7] ])
+    where
+    c_at : [7] -> Bit
+    c_at i = (m @ 0) ^ foldl (\acc j -> acc ^ ((m @ (j + 1)) && (i @ j)))
+                              False
+                              ([0..6] : [7][4])
+
+/**
+ * Encode with duplication: repeat codeword RMMF times.
+ * [HQC-SPEC] Section 3.4.3, "Encoding".
+ */
+rm_encode_dup : Byte -> [n2]
+rm_encode_dup m = join (repeat`{RMMF} (rm_encode_byte m))
+
+/**
+ * Expand and sum: count 1-bits across RMMF copies for each of 128 positions.
+ * [HQC-SPEC] Section 3.4.3, "Decoding", Step 1.
+ */
+expand_and_sum : [n2] -> [128]Integer
+expand_and_sum v = sums where
+    blocks : [RMMF][128]
+    blocks = [reverse blk | blk <- split v]
+    sums = [ foldl (\acc c -> if (blocks @ c) @ i then acc + 1 else acc)
+                   (0 : Integer)
+                   ([0..<RMMF] : [RMMF][width RMMF])
+           | i <- [0..127] : [128][8] ]
+
+/**
+ * Hadamard transform: 7 passes of butterfly operations.
+ * Each pass: dst[i] = src[2i] + src[2i+1], dst[i+64] = src[2i] - src[2i+1].
+ * [HQC-SPEC] Section 3.4.3, "Decoding", Step 2.
+ */
+hadamard_transform : [128]Integer -> [128]Integer
+hadamard_transform input = passes ! 0 where
+    passes : [8][128]Integer
+    passes = [input] # [butterfly (passes @ p) | p <- [0..6] : [7][4]]
+    butterfly : [128]Integer -> [128]Integer
+    butterfly src = [ if i < 64
+                      then (src @ (2 * i)) + (src @ (2 * i + 1))
+                      else (src @ (2 * (i - 64))) - (src @ (2 * (i - 64) + 1))
+                    | i <- [0..127] : [128]Integer ]
+
+/**
+ * Find peak: maximum absolute value gives position (7 bits) and sign (1 bit).
+ * Positive peak -> MSB of result = 1, negative -> MSB = 0.
+ * [HQC-SPEC] Section 3.4.3, "Decoding", Step 3.
+ */
+find_peaks : [128]Integer -> Byte
+find_peaks vals = result where
+    abs_val : Integer -> Integer
+    abs_val x = if x >= 0 then x else 0 - x
+
+    (_, best_idx, best_positive) =
+        foldl find_max (0 : Integer, 0 : [7], False) ([0..127] : [128][7])
+    find_max (bv, bi, bs) i =
+        if v > bv then (v, i, vals @ i > 0) else (bv, bi, bs)
+        where v = abs_val (vals @ i)
+
+    result = (if best_positive then (1 : [1]) else 0) # best_idx
+
+/**
+ * Full RM decode of one n2-bit block.
+ * [HQC-SPEC] Section 3.4.3, "Decoding".
+ */
+rm_decode_byte : [n2] -> Byte
+rm_decode_byte v = result where
+    sums = expand_and_sum v
+    transformed = hadamard_transform sums
+    // Bias subtraction at index 0
+    biased = update transformed (0 : [8]) ((transformed @ 0) - (`RMMF * 64 : Integer))
+    result = find_peaks biased
+
+/**
+ * RM encode/decode round-trip: decoding an encoded byte recovers it.
+ * This property covers all 256 possible byte values exhaustively.
+ * ```repl
+ * :exhaust rm_encode_decode_roundtrip
+ * ```
+ */
+property rm_encode_decode_roundtrip (m : Byte) =
+    rm_decode_byte (rm_encode_dup m) == m
+
+// ============================================================
+// Concatenated Code
+// [HQC-SPEC] Section 3.4.1
+// ============================================================
+
+/**
+ * Concatenated code encoding.
+ * message (k bytes) -> RS encode (n1 bytes) -> RM encode each byte (n1*n2 bits).
+ * [HQC-SPEC] Section 3.4.1, "C = C_1 o C_2".
+ */
+code_encode : [k]Byte -> [n1n2]
+code_encode msg = join (reverse [rm_encode_dup byte | byte <- rs_encode msg])
+
+/**
+ * Concatenated code decoding.
+ * n1*n2 bits -> RM decode each n2-bit block (n1 bytes) -> RS decode (k bytes).
+ * [HQC-SPEC] Section 3.4.1.
+ */
+code_decode : [n1n2] -> [k]Byte
+code_decode bits = rs_decode [rm_decode_byte block | block <- reverse (split bits)]
+
+/**
+ * Concatenated code round-trip: decoding an encoded message recovers it.
+ * ```repl
+ * :check code_encode_decode_roundtrip
+ * ```
+ */
+property code_encode_decode_roundtrip (msg : [k]Byte) =
+    code_decode (code_encode msg) == msg
+
+// ============================================================
+// GF(2)[X]/(X^n - 1) Polynomial Arithmetic
+// [HQC-SPEC] Section 3.3
+// ============================================================
+
+/**
+ * Multiply two polynomials in GF(2)[X]/(X^n - 1).
+ * Cryptol convention: MSB = highest degree coefficient.
+ * [HQC-SPEC] Section 3.3.
+ */
+vect_mul : [n] -> [n] -> [n]
+vect_mul a b = pmod (pmult a b) modulus where
+    modulus : [n + 1]
+    modulus = (1 << `n) || 1
+
+/**
+ * Polynomial multiplication in GF(2)[X]/(X^n-1) is commutative.
+ * ```repl
+ * :check vect_mul_commutative
+ * ```
+ */
+property vect_mul_commutative (a : [n]) (b : [n]) = vect_mul a b == vect_mul b a
+
+// -------------------- Serialization --------------------
+
+/**
+ * Convert a polynomial (n-bit bitvector) to bytes (little-endian bit order).
+ * Coefficient of x^i goes to byte i/8, bit position i%8.
+ * [HQC-SPEC] Section 3.3.
+ */
+bits_to_bytes : {m} (fin m, m >= 1) => [m] -> [m /^ 8]Byte
+bits_to_bytes poly = reverse (split`{m /^ 8} ((zero : [m /^ 8 * 8 - m]) # poly))
+
+/**
+ * Convert bytes back to a polynomial.
+ */
+bytes_to_bits : {m} (fin m, m >= 1) => [m /^ 8]Byte -> [m]
+bytes_to_bits bytes = drop`{m /^ 8 * 8 - m} (join (reverse bytes))
+
+// ============================================================
+// Hash Functions
+// [HQC-SPEC] Section 3.1
+// ============================================================
+
+/**
+ * Hash_I: seed expansion for PKE key generation.
+ * SHA3-512(seed_pke || 0x02) -> 64 bytes = seed_dk || seed_ek.
+ * [HQC-SPEC] Section 3.1, Table 1.
+ */
+Hash_I : [32]Byte -> [64]Byte
+Hash_I seed = split (SHA3_512::hash (join (seed # [0x02])))
+
+/**
+ * Hash_H: hash of encapsulation key.
+ * SHA3-256(ek || 0x01) -> 32 bytes.
+ * [HQC-SPEC] Section 3.1, Table 1.
+ */
+Hash_H : EncapsulationKey -> [32]Byte
+Hash_H ek = split (SHA3_256::hash (join (ek # [0x01])))
+
+/**
+ * Hash_G: derive shared secret K and encryption randomness theta.
+ * SHA3-512(hash_ek || m || salt || 0x00) -> 64 bytes = K || theta.
+ * [HQC-SPEC] Section 3.1, Table 1.
+ */
+Hash_G : [32]Byte -> [k]Byte -> [16]Byte -> [64]Byte
+Hash_G hash_ek m salt = split (SHA3_512::hash (join (hash_ek # m # salt # [0x00])))
+
+/**
+ * Hash_J: implicit rejection hash for decapsulation.
+ * SHA3-256(hash_ek || sigma || u_bytes || v_bytes || salt || 0x03) -> 32 bytes.
+ * [HQC-SPEC] Section 3.1, Table 1.
+ */
+Hash_J : [32]Byte -> [k]Byte -> [VEC_N_SIZE_BYTES]Byte -> [VEC_N1N2_SIZE_BYTES]Byte -> [16]Byte -> [32]Byte
+Hash_J hash_ek sigma u_bytes v_bytes salt =
+    split (SHA3_256::hash (join (hash_ek # sigma # u_bytes # v_bytes # salt # [0x03])))
+
+// ============================================================
+// XOF
+// [HQC-SPEC] Section 3.1
+// ============================================================
+
+/**
+ * SHAKE256 XOF with domain separator byte 0x01.
+ * [HQC-SPEC] Section 3.1.
+ */
+xof_bytes : {m} (fin m, m >= 1) => [m]Byte -> [inf]Byte
+xof_bytes seed = split (SHAKE256::xof (join (seed # [0x01])))
+
+// ============================================================
+// Sampling Functions
+// [HQC-SPEC] Section 3.2
+// ============================================================
+
+/**
+ * SampleFixedWeightVect_s: rejection sampling (used in key generation).
+ * Consumes 3 bytes per sample from the XOF stream, rejecting values
+ * above the threshold to ensure uniform distribution.
+ * [HQC-SPEC] Section 3.2, "SampleFixedWeightVect_s".
+ */
+SampleFixedWeight1 : {w} (fin w, w >= 1) =>
+    [inf]Byte -> [32] -> ([n], [32])
+SampleFixedWeight1 stream start_off = (result_vec, end_off) where
+    threshold : [24]
+    threshold = drop`{8} (((`(2^^24) : [32]) / (`n : [32])) * (`n : [32]))
+
+    type State = ( [n]          // vector
+                 , [w][width n] // positions found
+                 , [width w]    // count
+                 , [32]         // byte offset
+                 )
+
+    final = while
+        (\(_, _, count, _) -> count < `w)
+        sample_step
+        (zero, zero, 0, start_off)
+
+    sample_step : State -> State
+    sample_step (vec, pos, count, idx) =
+        if val24 >= threshold
+        then (vec, pos, count, new_idx)
+        else if is_dup
+             then (vec, pos, count, new_idx)
+             else ( update vec ((`n - 1 : [width n]) - candidate) True
+                  , update pos count candidate
+                  , count + 1
+                  , new_idx)
+        where
+            b0 = zext (stream @ idx) : [24]
+            b1 = zext (stream @ (idx + 1)) : [24]
+            b2 = zext (stream @ (idx + 2)) : [24]
+            val24 = b0 || (b1 << 8) || (b2 << 16)
+            new_idx = idx + 3
+            candidate = drop`{32 - width n}
+                             (((zext val24 : [32]) % (`n : [32]))) : [width n]
+            is_dup = foldl (\acc j ->
+                        if j < count
+                        then acc || ((pos @ j) == candidate)
+                        else acc)
+                     False
+                     ([0..<w] : [w][width w])
+
+    (result_vec, _, _, end_off) = final
+
+/**
+ * SampleFixedWeightVect: Fisher-Yates variant (used in encryption).
+ * Reads exactly 4*weight bytes. Constant-time duplicate resolution.
+ * [HQC-SPEC] Section 3.2, "SampleFixedWeightVect".
+ */
+SampleFixedWeight2 : {w} (fin w, w >= 1, width n >= width w, 32 >= width w) =>
+    [inf]Byte -> [32] -> ([n], [32])
+SampleFixedWeight2 stream start_off = (result_vec, start_off + 4 * `w) where
+    // Read 4 bytes per position, interpret as LE uint32
+    rand_u32 : [w][32]
+    rand_u32 = [ zext (stream @ (start_off + 4 * i)) ||
+                 (zext (stream @ (start_off + 4 * i + 1)) << 8) ||
+                 (zext (stream @ (start_off + 4 * i + 2)) << 16) ||
+                 (zext (stream @ (start_off + 4 * i + 3)) << 24)
+               | i <- [0..<w] : [w][32] ]
+
+    // Forward pass: support[i] = i + floor(rand * (n - i) / 2^32)
+    compute_support : [width w] -> [width n]
+    compute_support i = (zext i : [width n]) + result where
+        r = rand_u32 @ (zext i : [width n])
+        ni = (`n : [32]) - (zext i : [32])
+        prod = (zext r : [64]) * (zext ni : [64])
+        high32 = take`{32} prod : [32]
+        result = drop`{32 - width n} high32
+
+    support_init : [w][width n]
+    support_init = [compute_support i | i <- [0..<w] : [w][width w]]
+
+    // Backward reconciliation: if support[i] matches any later, replace with i
+    support_final = foldl reconcile support_init (reverse [0..<w] : [w][width w])
+    reconcile sup i =
+        if found then update sup (zext i : [width w]) (zext i : [width n]) else sup
+        where
+            found = foldl (\acc j ->
+                        if j > i /\ j < `w
+                        then acc || ((sup @ j) == (sup @ (zext i : [width w])))
+                        else acc)
+                    False
+                    ([0..<w] : [w][width w])
+
+    // Build bitvector from positions: coefficient of x^pos at index (n-1-pos)
+    result_vec = foldl (\v i -> update v ((`n - 1 : [width n]) - (support_final @ i)) True)
+                       (zero : [n])
+                       ([0..<w] : [w][width w])
+
+// ============================================================
+// HQC-PKE
+// [HQC-SPEC] Section 3.5
+// ============================================================
+
+/**
+ * HQC-PKE.Keygen: generate PKE key pair.
+ * Input: seed_pke (32 bytes, derived from KEM seed).
+ * Output: (ek_pke, seed_dk, y) where y is the decryption secret.
+ * [HQC-SPEC] Section 3.5, "HQC-PKE.Keygen".
+ */
+PKE_KeyGen : [32]Byte -> (EncapsulationKey, [32]Byte, [n])
+PKE_KeyGen seed_pke = (ek_pke, seed_dk, y) where
+    // Derive seed_dk and seed_ek
+    hash_out = Hash_I seed_pke
+    seed_dk : [32]Byte
+    seed_dk = take`{32} hash_out
+    seed_ek : [32]Byte
+    seed_ek = drop`{32} hash_out
+
+    // Sample y and x from SHAKE256(seed_dk || 0x01)
+    dk_stream = xof_bytes seed_dk
+    (y, off1) = SampleFixedWeight1`{omega} dk_stream 0
+    (x, _) = SampleFixedWeight1`{omega} dk_stream off1
+
+    // Generate h from SHAKE256(seed_ek || 0x01)
+    ek_stream = xof_bytes seed_ek
+    h = bytes_to_bits`{n} (take`{VEC_N_SIZE_BYTES} ek_stream)
+
+    // s = x + h * y in GF(2)[X]/(X^n - 1)
+    s = x ^ vect_mul h y
+
+    // Serialize
+    s_bytes = bits_to_bytes`{n} s
+    ek_pke = seed_ek # s_bytes
+
+/**
+ * HQC-PKE.Encrypt: encrypt a message.
+ * Input: ek_pke, message m (k bytes), randomness theta (32 bytes).
+ * Output: (u_bytes, v_bytes) as the PKE ciphertext.
+ * [HQC-SPEC] Section 3.5, "HQC-PKE.Encrypt".
+ */
+PKE_Encrypt : EncapsulationKey -> [k]Byte -> [32]Byte ->
+              ([VEC_N_SIZE_BYTES]Byte, [VEC_N1N2_SIZE_BYTES]Byte)
+PKE_Encrypt ek_pke m theta = (u_bytes, v_bytes) where
+    // Parse ek_pke
+    seed_ek : [32]Byte
+    seed_ek = take`{32} ek_pke
+    s_bytes : [VEC_N_SIZE_BYTES]Byte
+    s_bytes = drop`{32} ek_pke
+
+    // Reconstruct h and s
+    ek_stream = xof_bytes seed_ek
+    h = bytes_to_bits`{n} (take`{VEC_N_SIZE_BYTES} ek_stream)
+    s = bytes_to_bits`{n} s_bytes
+
+    // Sample r2, e, r1 from SHAKE256(theta || 0x01)
+    theta_stream = xof_bytes theta
+    (r2, off1) = SampleFixedWeight2`{omega_r} theta_stream 0
+    (e, off2)  = SampleFixedWeight2`{omega_e} theta_stream off1
+    (r1, _)    = SampleFixedWeight2`{omega_r} theta_stream off2
+
+    // u = r1 + h * r2
+    u = r1 ^ vect_mul h r2
+
+    // v = code_encode(m) + Truncate_{n1n2}(s * r2 + e)
+    encoded = code_encode m
+    tmp = (vect_mul s r2) ^ e
+    // Truncate: keep the low n1n2 coefficients (x^0 .. x^{n1n2-1})
+    // In Cryptol, MSB = highest degree, so low coefficients are at the end
+    v = encoded ^ drop`{n - n1n2} tmp
+
+    // Serialize
+    u_bytes = bits_to_bytes`{n} u
+    v_bytes = bits_to_bytes`{n1n2} v
+
+/**
+ * HQC-PKE.Decrypt: decrypt a ciphertext.
+ * Input: seed_dk (32 bytes), ciphertext (u_bytes, v_bytes).
+ * Output: decoded message (k bytes).
+ * [HQC-SPEC] Section 3.5, "HQC-PKE.Decrypt".
+ */
+PKE_Decrypt : [32]Byte -> [VEC_N_SIZE_BYTES]Byte -> [VEC_N1N2_SIZE_BYTES]Byte -> [k]Byte
+PKE_Decrypt seed_dk u_bytes v_bytes = m where
+    // Reconstruct y from seed_dk
+    dk_stream = xof_bytes seed_dk
+    (y, _) = SampleFixedWeight1`{omega} dk_stream 0
+
+    // Deserialize
+    u = bytes_to_bits`{n} u_bytes
+    v = bytes_to_bits`{n1n2} v_bytes
+
+    // Compute v + Truncate_{n1n2}(u * y) and decode
+    tmp = vect_mul u y
+    noisy = v ^ drop`{n - n1n2} tmp
+    m = code_decode noisy
+
+// ============================================================
+// HQC-KEM
+// [HQC-SPEC] Section 3.6
+// ============================================================
+
+/**
+ * HQC-KEM.Keygen: generate KEM key pair.
+ * Input: seed_kem (32 bytes of randomness).
+ * Output: (ek, dk).
+ * [HQC-SPEC] Section 3.6, "HQC-KEM.Keygen".
+ */
+KeyGen : [32]Byte -> (EncapsulationKey, DecapsulationKey)
+KeyGen seed_kem = (ek, dk) where
+    // Derive seed_pke (32 bytes) and sigma (k bytes) from seed_kem
+    kem_stream = xof_bytes seed_kem
+    seed_pke : [32]Byte
+    seed_pke = take`{32} kem_stream
+    sigma : [k]Byte
+    sigma = take`{k} (drop`{32} kem_stream)
+
+    // Generate PKE keys
+    (ek_pke, seed_dk, _) = PKE_KeyGen seed_pke
+
+    // KEM keys
+    ek = ek_pke
+    dk = ek_pke # seed_dk # sigma # seed_kem
+
+/**
+ * HQC-KEM.Encaps: encapsulation.
+ * Input: ek (encapsulation key), m (k random bytes), salt (16 random bytes).
+ * Output: (shared_secret, ciphertext).
+ * [HQC-SPEC] Section 3.6, "HQC-KEM.Encaps".
+ */
+Encaps : EncapsulationKey -> [k]Byte -> [16]Byte -> (SharedSecretKey, Ciphertext)
+Encaps ek m salt = (K, ct) where
+    // Hash the encapsulation key
+    hash_ek = Hash_H ek
+
+    // Derive K and theta
+    g_out = Hash_G hash_ek m salt
+    K : SharedSecretKey
+    K = take`{32} g_out
+    theta : [32]Byte
+    theta = drop`{32} g_out
+
+    // Encrypt
+    (u_bytes, v_bytes) = PKE_Encrypt ek m theta
+
+    // Ciphertext = u || v || salt
+    ct = u_bytes # v_bytes # salt
+
+/**
+ * HQC-KEM.Decaps: decapsulation with implicit rejection.
+ * Input: dk (decapsulation key), ct (ciphertext).
+ * Output: shared secret key.
+ * [HQC-SPEC] Section 3.6, "HQC-KEM.Decaps".
+ */
+Decaps : DecapsulationKey -> Ciphertext -> SharedSecretKey
+Decaps dk ct = ss where
+    // Parse decapsulation key
+    ek_pke : EncapsulationKey
+    ek_pke = take`{CRYPTO_PUBLICKEYBYTES} dk
+    seed_dk : [32]Byte
+    seed_dk = take`{32} (drop`{CRYPTO_PUBLICKEYBYTES} dk)
+    sigma : [k]Byte
+    sigma = take`{k} (drop`{CRYPTO_PUBLICKEYBYTES + 32} dk)
+    // seed_kem is at the end but not needed for decaps
+
+    // Parse ciphertext
+    u_bytes : [VEC_N_SIZE_BYTES]Byte
+    u_bytes = take`{VEC_N_SIZE_BYTES} ct
+    v_bytes : [VEC_N1N2_SIZE_BYTES]Byte
+    v_bytes = take`{VEC_N1N2_SIZE_BYTES} (drop`{VEC_N_SIZE_BYTES} ct)
+    salt : [16]Byte
+    salt = drop`{VEC_N_SIZE_BYTES + VEC_N1N2_SIZE_BYTES} ct
+
+    // Decrypt
+    m_prime = PKE_Decrypt seed_dk u_bytes v_bytes
+
+    // Re-derive K and theta
+    hash_ek = Hash_H ek_pke
+    g_out = Hash_G hash_ek m_prime salt
+    K_prime : SharedSecretKey
+    K_prime = take`{32} g_out
+    theta_prime : [32]Byte
+    theta_prime = drop`{32} g_out
+
+    // Re-encrypt
+    (u_prime_bytes, v_prime_bytes) = PKE_Encrypt ek_pke m_prime theta_prime
+
+    // Compare ciphertexts
+    ct_match = (u_bytes == u_prime_bytes) /\ (v_bytes == v_prime_bytes)
+
+    // Implicit rejection
+    K_bar = Hash_J hash_ek sigma u_bytes v_bytes salt
+
+    ss = if ct_match then K_prime else K_bar
+
+/**
+ * KEM correctness: for any valid key pair, Decaps recovers the
+ * shared secret produced by Encaps.
+ * This is the fundamental correctness property of the KEM.
+ * [HQC-SPEC] Section 3.6.
+ * NOTE: Each test takes ~10s, so `:check` with 100 tests takes ~15 minutes.
+ * Use `:set tests=5` for a quicker smoke test.
+ * ```repl
+ * :check kem_correctness
+ * ```
+ */
+property kem_correctness (seed_kem : [32]Byte) (m : [k]Byte) (salt : [16]Byte) = ss == K where
+    (ek, dk) = KeyGen seed_kem
+    (K, ct) = Encaps ek m salt
+    ss = Decaps dk ct

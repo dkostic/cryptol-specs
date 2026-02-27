@@ -1,0 +1,53 @@
+:l Primitive/Asymmetric/KEM/HQC/Tests/HQC128.cry
+:set tests=10
+
+// GF(2^8)
+:prove gf_mul_commutative
+:prove gf_alpha_primitive
+:exhaust gf_inv_correct
+:check gf_mul_associative
+:check gf_mul_distributive
+:exhaust gf_exp_matches_pow
+
+// Reed-Solomon
+:prove rs_encode_correct
+:prove rs_decode_correct
+:prove rs_generator_roots
+:check rs_encode_decode_roundtrip
+:check rs_syndromes_zero_for_valid_codeword
+:check rs_decode_1error
+:check rs_decode_max_errors
+:check rs_decode_beyond_capacity_fails
+
+// Reed-Muller
+:exhaust rm_encode_decode_roundtrip
+:exhaust rm_decode_1bit_noise
+:exhaust rm_decode_heavy_noise
+:check rm_roundtrip
+
+// Concatenated code
+:prove code_roundtrip
+:check code_encode_decode_roundtrip
+:check code_decode_1bit_noise
+:check code_encode_injective
+
+// Polynomial arithmetic
+:check vect_mul_commutative
+:check vect_mul_identity
+:check vect_mul_zero
+
+// Serialization
+:check serialization_roundtrip
+
+// Hash functions
+:prove hash_i_correct
+:prove seed_derivation_correct
+:prove keygen_seeds_correct
+:prove hash_g_correct
+
+// KEM
+:prove keygen_correct
+:prove encaps_correct
+:prove decaps_correct
+:check kem_correctness
+:check kem_implicit_rejection
